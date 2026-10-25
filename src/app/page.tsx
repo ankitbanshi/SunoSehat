@@ -13,7 +13,7 @@ type Appointment = { id: string; title: string; when: string; notes?: string };
 const STORAGE = "sunosehat-v1";
 function extractReportFields(text: string) {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const pick = (labels: string[]) => lines.find(line => labels.some(label => new RegExp(`^${label}\\s*[:—-]`, "i").test(line))) || "Needs confirmation";
+  const pick = (labels: string[]) => { const line = lines.find(line => labels.some(label => new RegExp(`^${label}\\s*[:—-]`, "i").test(line))); return line?.replace(/^[^:—-]+[:—-]\s*/, "").trim() || ""; };
   return [["Patient name",pick(["Patient(?: name)?"])],["Report date",pick(["Date","Report date"])],["Doctor / clinic",pick(["Doctor","Hospital","Clinic"])],["Condition mentioned",pick(["Diagnosis","Condition","Impression"])],["Medicine text",pick(["Medicine","Medication","Rx"])],["Medicine directions",pick(["Dosage instructions?","Dose","Directions","Instructions","How to take","Frequency","Schedule"])],["Food instructions",pick(["Food instructions?","Food","Before food","After food","With food"])],["Follow-up",pick(["Follow-up","Appointment"])]];
 }
 
@@ -55,8 +55,10 @@ export default function Page() {
   const [lastSpeech, setLastSpeech] = useState("");
   const [speechActive, setSpeechActive] = useState(false);
   const [speechPaused, setSpeechPaused] = useState(false);
-  const [translationBusy, setTranslationBusy] = useState(false);
-  const [translatedReport, setTranslatedReport] = useState("");
+  const [explanationBusy, setExplanationBusy] = useState(false);
+  const [reportExplanation, setReportExplanation] = useState("");
+  const [explainedText, setExplainedText] = useState("");
+  const [explainedLanguage, setExplainedLanguage] = useState("");
   const [voiceInput, setVoiceInput] = useState("");
   const [lastQuery, setLastQuery] = useState("");
   const [voiceReply, setVoiceReply] = useState("नमस्ते! मैं आपकी दवाओं, रिपोर्ट और एलर्जी की जानकारी ढूँढ़ने में मदद कर सकता हूँ।");
@@ -69,18 +71,58 @@ export default function Page() {
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE);
-      if (saved) {
-        const data = JSON.parse(saved);
-        setProfile(data.profile ?? { name: "", language: "Hindi", age: "", emergency: "", allergies: [] });
-        setMeds(data.meds ?? []); setReports(data.reports ?? []); setDoses(data.doses ?? {}); setAppointments(data.appointments ?? (data.isDemo ? makeDemo().appointments : [])); setIsDemo(!!data.isDemo);
-      } else setShowSetup(true);
-    } catch { setShowSetup(true); }
-    if ("Notification" in window) setNotifPermission(Notification.permission);
-    setReady(true);
+    const load = async () => {
+      let localData: any = null;
+      try {
+        const saved = localStorage.getItem(STORAGE);
+        if (saved) {
+          localData = JSON.parse(saved);
+          setProfile(localData.profile ?? { name: "", language: "Hindi", age: "", emergency: "", allergies: [] });
+          setMeds(localData.meds ?? []); setReports(localData.reports ?? []); setDoses(localData.doses ?? {});
+          setAppointments(localData.appointments ?? (localData.isDemo ? makeDemo().appointments : [])); setIsDemo(!!localData.isDemo);
+        }
+        let token = localStorage.getItem("sunosehat-device-token");
+        if (!token) { token = crypto.randomUUID(); localStorage.setItem("sunosehat-device-token", token); }
+        const headers = { "x-device-token": token };
+        const response = await fetch("/api/data", { headers });
+        if (response.ok) {
+          const remote = await response.json();
+          if (remote.data) {
+            localData = remote.data;
+            setProfile(remote.data.profile ?? { name: "", language: "Hindi", age: "", emergency: "", allergies: [] });
+            setMeds(remote.data.meds ?? []); setReports(remote.data.reports ?? []); setDoses(remote.data.doses ?? {});
+            setAppointments(remote.data.appointments ?? []); setIsDemo(!!remote.data.isDemo);
+            localStorage.setItem(STORAGE, JSON.stringify(remote.data));
+          } else if (localData) {
+            await fetch("/api/data", { method: "PUT", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify({ data: localData }) });
+          }
+        } else {
+          setNotice("MongoDB is unavailable. Your information is still saved on this device.");
+        }
+        if (!localData) setShowSetup(true);
+      } catch {
+        if (!localData) setShowSetup(true);
+        setNotice("MongoDB is unavailable. Your information is still saved on this device.");
+      }
+      if ("Notification" in window) setNotifPermission(Notification.permission);
+      setReady(true);
+    };
+    void load();
   }, []);
-  useEffect(() => { if (!ready) return; try { localStorage.setItem(STORAGE, JSON.stringify({ profile, meds, reports, doses, appointments, isDemo })); } catch { setNotice("Local storage is unavailable. Your changes may not persist after closing this browser."); } }, [ready, profile, meds, reports, doses, appointments, isDemo]);
+  useEffect(() => {
+    if (!ready) return;
+    const data = { profile, meds, reports, doses, appointments, isDemo };
+    try { localStorage.setItem(STORAGE, JSON.stringify(data)); } catch { setNotice("Local storage is unavailable. Your changes may not persist after closing this browser."); }
+    const timeout = window.setTimeout(async () => {
+      try {
+        const token = localStorage.getItem("sunosehat-device-token");
+        if (!token) return;
+        const response = await fetch("/api/data", { method: "PUT", headers: { "Content-Type": "application/json", "x-device-token": token }, body: JSON.stringify({ data }) });
+        if (!response.ok) setNotice("MongoDB could not save this change. Your information is still saved on this device.");
+      } catch { setNotice("MongoDB could not save this change. Your information is still saved on this device."); }
+    }, 500);
+    return () => window.clearTimeout(timeout);
+  }, [ready, profile, meds, reports, doses, appointments, isDemo]);
   useEffect(() => { const t = setInterval(() => setCurrentTime(new Date()), 15000); return () => clearInterval(t); }, []);
   useEffect(() => { if (!lastQuery) setVoiceReply(profile.language === "Hindi" ? "नमस्ते! मैं आपकी दवाओं, रिपोर्ट और एलर्जी की जानकारी ढूँढ़ने में मदद कर सकता हूँ।" : "Hello! I can help you find your medicines, read your report, or review your saved allergies."); }, [profile.language, lastQuery]);
   useEffect(() => {
@@ -134,19 +176,25 @@ export default function Page() {
     u.onerror = () => { setSpeechActive(false); setSpeechPaused(false); };
     setSpeechActive(true); setSpeechPaused(false); synthesis.speak(u); setLastSpeech(text);
   }, [profile.language]);
-  const listenToReport = async (text: string) => {
-    const summary = explain(text);
-    if (profile.language !== "Hindi") { setTranslatedReport(""); speak(summary); return; }
-    setTranslationBusy(true);
+  const explainWithSarvam = async (text: string) => {
+    if (!text.trim()) return "";
+    setExplanationBusy(true);
     try {
-      const response = await fetch("/api/translate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: summary }) });
+      const response = await fetch("/api/report-summary", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, language: profile.language }) });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "हिंदी अनुवाद अभी उपलब्ध नहीं है।");
-      setTranslatedReport(result.translatedText);
-      speak(result.translatedText);
+      if (!response.ok) throw new Error(result.error || "रिपोर्ट की व्याख्या अभी उपलब्ध नहीं है।");
+      setReportExplanation(result.summary);
+      setExplainedText(text);
+      setExplainedLanguage(profile.language);
+      return result.summary as string;
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "हिंदी अनुवाद अभी उपलब्ध नहीं है।");
-    } finally { setTranslationBusy(false); }
+      setNotice(error instanceof Error ? error.message : "रिपोर्ट की व्याख्या अभी उपलब्ध नहीं है।");
+      return "";
+    } finally { setExplanationBusy(false); }
+  };
+  const listenToReport = async (text: string) => {
+    const summary = text === explainedText && reportExplanation && explainedLanguage === profile.language ? reportExplanation : await explainWithSarvam(text);
+    if (summary) speak(summary);
   };
   const pauseSpeech = () => { if ("speechSynthesis" in window && window.speechSynthesis.speaking) { window.speechSynthesis.pause(); setSpeechPaused(true); } };
   const resumeSpeech = () => { if ("speechSynthesis" in window && window.speechSynthesis.paused) { window.speechSynthesis.resume(); setSpeechPaused(false); } };
@@ -177,7 +225,7 @@ export default function Page() {
     if (!/^image\/(jpeg|png|webp)$/.test(file.type)) { setNotice("Choose a JPEG, PNG, or WebP image."); return; }
     if (file.size > 8 * 1024 * 1024) { setNotice("Image is too large. Choose a file under 8 MB."); return; }
     setReportImage(URL.createObjectURL(file)); setOcrBusy(true); setOcrStatus(profile.language==="Hindi"?"तस्वीर से रिपोर्ट का पाठ निकाला जा रहा है…":"Reading the report…");
-    try { const worker = await createWorker(profile.language === "Hindi" ? "hin" : "eng", 1, { logger: m => { if (m.status === "recognizing text") setOcrStatus(profile.language==="Hindi"?`रिपोर्ट पढ़ रहे हैं… ${Math.round(m.progress * 100)}%`:`Reading the report… ${Math.round(m.progress * 100)}%`); } }); const { data } = await worker.recognize(file); await worker.terminate(); setReportText(data.text); setTranslatedReport(""); setOcrStatus(profile.language==="Hindi"?"रिपोर्ट का पाठ तैयार है। चाहें तो सेव करने से पहले इसे बदल सकते हैं।":"Report text is ready. You can edit it before saving."); }
+    try { const worker = await createWorker(profile.language === "Hindi" ? "hin" : "eng", 1, { logger: m => { if (m.status === "recognizing text") setOcrStatus(profile.language==="Hindi"?`रिपोर्ट पढ़ रहे हैं… ${Math.round(m.progress * 100)}%`:`Reading the report… ${Math.round(m.progress * 100)}%`); } }); const { data } = await worker.recognize(file); await worker.terminate(); setReportText(data.text); setReportExplanation(""); setExplainedText(""); setExplainedLanguage(""); setOcrStatus(profile.language==="Hindi"?"रिपोर्ट का पाठ तैयार है। आसान सारांश बनाया जा रहा है…":"Report text is ready. Preparing a simple explanation…"); await explainWithSarvam(data.text); }
     catch { setOcrStatus(profile.language==="Hindi"?"इस तस्वीर से पाठ नहीं मिल पाया। आप नीचे रिपोर्ट का पाठ लिख या चिपका सकते हैं।":"I couldn’t read text from this image. You can type or paste the report below."); }
     finally { setOcrBusy(false); }
   };
@@ -186,7 +234,7 @@ export default function Page() {
     const fields = extractReportFields(text);
     const get = (label: string) => {
       const raw = fields.find(([name]) => name === label)?.[1] as string | undefined;
-      if (!raw || raw === "Needs confirmation") return "";
+      if (!raw) return "";
       const colon = raw.indexOf(":"); return colon >= 0 ? raw.slice(colon + 1).trim() : raw;
     };
     const patient = get("Patient name"); const date = get("Report date"); const clinic = get("Doctor / clinic");
@@ -290,10 +338,10 @@ export default function Page() {
         <div className="schedule-list">{todayDoses.length ? todayDoses.map(({med,time,key})=><DoseRow key={key} med={med} time={time} dose={doses[key]} onTake={()=>setConfirmDose(med)} onMiss={()=>doseAction(med,"missed",time)}/>) : <div className="empty-card"><div className="empty-icon"><Pill size={22}/></div><b>No medicines scheduled yet</b><p>Add your prescribed schedule to see reminders here.</p><button className="outline-button" onClick={()=>startNewMed()}>Add a medicine</button></div>}</div>
         <div className="dashboard-bottom"><div className="adherence-card"><div className="mini-card-title"><span className="mini-icon mint"><CheckCircle2 size={18}/></span><div><b>Today’s progress</b><small>Based on doses you marked taken</small></div></div><div className="progress-row"><div className="progress-track"><span style={{width:`${adherence}%`}}/></div><b>{adherence}%</b></div><small className="muted">{takenCount} of {todayDoses.length} scheduled doses marked taken</small></div><div className="allergy-card"><div className="mini-card-title"><span className="mini-icon yellow"><AlertTriangle size={18}/></span><div><b>Allergy information</b><small>Recorded profile · not a safety clearance</small></div></div><p>{profile.allergies.length?profile.allergies.join(", "):"No allergies recorded. This does not mean there are no allergies."}</p><button className="text-link" onClick={()=>setSection("My Health")}>Review profile <ArrowRight size={15}/></button></div></div>
         <div className="section-heading recent-heading"><div><h2>Recent reports</h2><p>Your saved documents, stored on this device.</p></div><button className="text-link" onClick={()=>setSection("My Health")}>All reports <ArrowRight size={16}/></button></div>
-        <div className="reports-row">{reports.slice(0,2).map(r=><button className="report-tile" key={r.id} onClick={()=>{setReportText(r.text);setTranslatedReport("");setReportTitle(r.title);setSection("My Health");}}><span className="file-icon"><FileText size={19}/></span><span><b>{r.title}</b><small>{r.date} · Saved report</small></span><ArrowRight size={16}/></button>)}{!reports.length&&<div className="report-empty">No reports yet. Scan a document to get started.</div>}</div>
+        <div className="reports-row">{reports.slice(0,2).map(r=><button className="report-tile" key={r.id} onClick={()=>{setReportText(r.text);setReportExplanation("");setExplainedText("");setExplainedLanguage("");setReportTitle(r.title);setSection("My Health");}}><span className="file-icon"><FileText size={19}/></span><span><b>{r.title}</b><small>{r.date} · Saved report</small></span><ArrowRight size={16}/></button>)}{!reports.length&&<div className="report-empty">No reports yet. Scan a document to get started.</div>}</div>
       </div>}
 
-      {section === "Scan Report" && <div className="page-content narrow-page"><div className="eyebrow">DOCUMENTS</div><h1>{profile.language==="Hindi"?"मेडिकल रिपोर्ट समझें":"Understand a medical report"}</h1><p className="subhead">{profile.language==="Hindi"?"रिपोर्ट की तस्वीर जोड़ें और इसे आसान भाषा में समझें।":"Add a report image and get a simple explanation."}</p><div className="scan-card"><div className="scan-drop"><div className="scan-illustration"><FileImage size={32}/></div><h2>{profile.language==="Hindi"?"रिपोर्ट की तस्वीर जोड़ें":"Add a report image"}</h2><p>JPEG, PNG या WebP · 8 MB तक</p><div className="button-row"><button className="primary-button" onClick={()=>inputRef.current?.click()}><ScanLine size={17}/>{profile.language==="Hindi"?"तस्वीर चुनें":"Choose image"}</button><label className="outline-button file-label">{profile.language==="Hindi"?"कैमरा इस्तेमाल करें":"Use camera"}<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={e=>chooseFile(e.target.files?.[0])}/></label></div><input ref={inputRef} className="hidden-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={e=>chooseFile(e.target.files?.[0])}/></div></div>{reportImage&&<div className="image-preview"><img src={reportImage} alt="Selected medical report preview"/><button className="icon-button" aria-label="Remove image" onClick={()=>{setReportImage("");setOcrStatus("");}}><X size={18}/></button></div>}{ocrStatus&&<div className={`status-line ${ocrBusy?"loading":""}`} aria-live="polite">{ocrBusy?<span className="spinner"/>:<CheckCircle2 size={17}/>} {ocrStatus}</div>}<div className="editor-card"><label className="field-label" htmlFor="report-title">{profile.language==="Hindi"?"रिपोर्ट का नाम":"Report name"}</label><input id="report-title" className="text-input" value={reportTitle} onChange={e=>setReportTitle(e.target.value)}/><div className="field-label-row"><label className="field-label" htmlFor="report-text">{profile.language==="Hindi"?"रिपोर्ट का पाठ":"Report text"} <span>· {profile.language==="Hindi"?"बदल सकते हैं":"editable"}</span></label><button className="text-link" onClick={()=>listenToReport(reportText)} disabled={!reportText||translationBusy}><Volume2 size={15}/> {profile.language==="Hindi"?(translationBusy?"अनुवाद हो रहा है…":"हिंदी में सुनें"):"Listen"}</button></div><textarea id="report-text" className="text-area report-editor" value={reportText} onChange={e=>{setReportText(e.target.value);setTranslatedReport("");}} placeholder={profile.language==="Hindi"?"यहाँ रिपोर्ट का पाठ लिखें या चिपकाएँ।":"Report text will appear here. You can also type or paste it."}/><div className="structured-preview"><div className="structured-heading"><FileText size={16}/> {profile.language==="Hindi"?"रिपोर्ट की जानकारी":"Report details"} <small>{profile.language==="Hindi"?"यहाँ रिपोर्ट में लिखी जानकारी है":"Information written in the report"}</small></div><div className="structured-grid">{extractReportFields(reportText).map(([label,value])=><div key={label}><small>{profile.language==="Hindi"?({"Patient name":"मरीज़ का नाम","Report date":"रिपोर्ट की तारीख","Doctor / clinic":"डॉक्टर / क्लिनिक","Condition mentioned":"रिपोर्ट में लिखी स्थिति","Medicine text":"दवा का नाम","Medicine directions":"दवा लेने का तरीका","Food instructions":"खाने से जुड़ा निर्देश","Follow-up":"आगे की मुलाक़ात"}[label]||label):label}</small><b>{profile.language==="Hindi"&&value==="Needs confirmation"?"जानकारी नहीं मिली":value}</b></div>)}</div></div><section className="summary-preview" aria-live="polite"><div className="summary-preview-heading"><div><Sparkles size={16}/><b>{profile.language==="Hindi"?"आसान भाषा में":"Simple explanation"}</b></div><div className="speech-controls"><button className="text-link" onClick={()=>listenToReport(reportText)} disabled={!reportText.trim()||translationBusy}><Volume2 size={15}/> {profile.language==="Hindi"?(translationBusy?"अनुवाद हो रहा है…":"हिंदी में सुनें"):"Listen"}</button><button className="outline-button compact" onClick={speechPaused?resumeSpeech:pauseSpeech} disabled={!speechActive}>{speechPaused?<Play size={14}/>:<Pause size={14}/>} {speechPaused?(profile.language==="Hindi"?"फिर चलाएँ":"Resume"):(profile.language==="Hindi"?"रोकें":"Pause")}</button><button className="outline-button compact" onClick={stopSpeech} disabled={!speechActive}><VolumeX size={14}/> {profile.language==="Hindi"?"बंद":"Stop"}</button></div></div><p className="explanation">{reportText.trim()?(profile.language==="Hindi"&&translatedReport?translatedReport:explain(reportText)):(profile.language==="Hindi"?"रिपोर्ट जोड़ें या उसका पाठ डालें, फिर यहाँ आसान भाषा में समझें।":"Add or upload report text to see a plain-language explanation here.")}</p></section><p className="helper-text"><AlertTriangle size={15}/>{profile.language==="Hindi"?"दवा लेने का तरीका साफ़ न हो, तो अपने डॉक्टर या फार्मासिस्ट से पूछें। हिंदी में रिपोर्ट सुनाने के लिए उसका सारांश Sarvam AI को अनुवाद हेतु भेजा जाएगा।":"If the medicine directions are unclear, ask your doctor or pharmacist. Hindi report audio sends its summary to Sarvam AI for translation."}</p><button className="primary-button" onClick={saveReport} disabled={!reportText.trim()}><Check size={17}/> {profile.language==="Hindi"?"रिपोर्ट सेव करें":"Save report"}</button></div></div>}
+      {section === "Scan Report" && <div className="page-content narrow-page"><div className="eyebrow">DOCUMENTS</div><h1>{profile.language==="Hindi"?"मेडिकल रिपोर्ट समझें":"Understand a medical report"}</h1><p className="subhead">{profile.language==="Hindi"?"रिपोर्ट की तस्वीर जोड़ें। इसका पाठ आसान भाषा में समझाने के लिए Sarvam AI को भेजा जाएगा।":"Add a report image. Its text is sent to Sarvam AI for a simple explanation."}</p><div className="scan-card"><div className="scan-drop"><div className="scan-illustration"><FileImage size={32}/></div><h2>{profile.language==="Hindi"?"रिपोर्ट की तस्वीर जोड़ें":"Add a report image"}</h2><p>JPEG, PNG या WebP · 8 MB तक</p><div className="button-row"><button className="primary-button" onClick={()=>inputRef.current?.click()}><ScanLine size={17}/>{profile.language==="Hindi"?"तस्वीर चुनें":"Choose image"}</button><label className="outline-button file-label">{profile.language==="Hindi"?"कैमरा इस्तेमाल करें":"Use camera"}<input type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={e=>chooseFile(e.target.files?.[0])}/></label></div><input ref={inputRef} className="hidden-input" type="file" accept="image/jpeg,image/png,image/webp" onChange={e=>chooseFile(e.target.files?.[0])}/></div></div>{reportImage&&<div className="image-preview"><img src={reportImage} alt="Selected medical report preview"/><button className="icon-button" aria-label="Remove image" onClick={()=>{setReportImage("");setOcrStatus("");}}><X size={18}/></button></div>}{ocrStatus&&<div className={`status-line ${ocrBusy?"loading":""}`} aria-live="polite">{ocrBusy?<span className="spinner"/>:<CheckCircle2 size={17}/>} {ocrStatus}</div>}<div className="editor-card"><label className="field-label" htmlFor="report-title">{profile.language==="Hindi"?"रिपोर्ट का नाम":"Report name"}</label><input id="report-title" className="text-input" value={reportTitle} onChange={e=>setReportTitle(e.target.value)}/><div className="field-label-row"><label className="field-label" htmlFor="report-text">{profile.language==="Hindi"?"रिपोर्ट का पाठ":"Report text"} <span>· {profile.language==="Hindi"?"बदल सकते हैं":"editable"}</span></label><button className="text-link" onClick={()=>listenToReport(reportText)} disabled={!reportText||explanationBusy}><Volume2 size={15}/> {profile.language==="Hindi"?(explanationBusy?"समझा रहे हैं…":"सुनें"):"Listen"}</button></div><textarea id="report-text" className="text-area report-editor" value={reportText} onChange={e=>{setReportText(e.target.value);setReportExplanation("");setExplainedText("");setExplainedLanguage("");}} onBlur={()=>{if(reportText.trim()&&explainedText!==reportText)void explainWithSarvam(reportText);}} placeholder={profile.language==="Hindi"?"यहाँ रिपोर्ट का पाठ लिखें या चिपकाएँ।":"Report text will appear here. You can also type or paste it."}/><div className="structured-preview"><div className="structured-heading"><FileText size={16}/> {profile.language==="Hindi"?"रिपोर्ट की जानकारी":"Report details"} <small>{profile.language==="Hindi"?"यहाँ रिपोर्ट में लिखी जानकारी है":"Information written in the report"}</small></div><div className="structured-grid">{extractReportFields(reportText).filter(([,value])=>Boolean(value)).map(([label,value])=><div key={label}><small>{profile.language==="Hindi"?({"Patient name":"मरीज़ का नाम","Report date":"रिपोर्ट की तारीख","Doctor / clinic":"डॉक्टर / क्लिनिक","Condition mentioned":"रिपोर्ट में लिखी स्थिति","Medicine text":"दवा का नाम","Medicine directions":"दवा लेने का तरीका","Food instructions":"खाने से जुड़ा निर्देश","Follow-up":"आगे की मुलाक़ात"}[label]||label):label}</small><b>{value}</b></div>)}{!extractReportFields(reportText).some(([,value])=>Boolean(value))&&<p className="muted">{profile.language==="Hindi"?"रिपोर्ट की जानकारी का आसान सारांश नीचे दिया गया है।":"A simple explanation of the report appears below."}</p>}</div></div><section className="summary-preview" aria-live="polite"><div className="summary-preview-heading"><div><Sparkles size={16}/><b>{profile.language==="Hindi"?"आसान भाषा में":"Simple explanation"}</b></div><div className="speech-controls"><button className="text-link" onClick={()=>listenToReport(reportText)} disabled={!reportText.trim()||explanationBusy}><Volume2 size={15}/> {profile.language==="Hindi"?(explanationBusy?"समझा रहे हैं…":"सुनें"):"Listen"}</button><button className="outline-button compact" onClick={speechPaused?resumeSpeech:pauseSpeech} disabled={!speechActive}>{speechPaused?<Play size={14}/>:<Pause size={14}/>} {speechPaused?(profile.language==="Hindi"?"फिर चलाएँ":"Resume"):(profile.language==="Hindi"?"रोकें":"Pause")}</button><button className="outline-button compact" onClick={stopSpeech} disabled={!speechActive}><VolumeX size={14}/> {profile.language==="Hindi"?"बंद":"Stop"}</button></div></div><p className="explanation">{reportText.trim()?(reportExplanation&&explainedText===reportText&&explainedLanguage===profile.language?reportExplanation:(explanationBusy?(profile.language==="Hindi"?"रिपोर्ट को आसान भाषा में समझा जा रहा है…":"Preparing a simple explanation…"):explain(reportText))):(profile.language==="Hindi"?"रिपोर्ट जोड़ें या उसका पाठ डालें, फिर यहाँ आसान भाषा में समझें।":"Add or upload report text to see a plain-language explanation here.")}</p></section><p className="helper-text"><AlertTriangle size={15}/>{profile.language==="Hindi"?"रिपोर्ट का सारांश आसान भाषा में Sarvam AI से तैयार किया जाता है।":"The report text is sent to Sarvam AI to prepare this simple explanation."}</p><button className="primary-button" onClick={saveReport} disabled={!reportText.trim()}><Check size={17}/> {profile.language==="Hindi"?"रिपोर्ट सेव करें":"Save report"}</button></div></div>}
 
       {section === "My Medicines" && <div className="page-content"><div className="page-title-row"><div><div className="eyebrow">YOUR SCHEDULE</div><h1>My medicines</h1><p className="subhead">Saved instructions are not a substitute for your prescription.</p></div><button className="primary-button" onClick={()=>startNewMed()}><Plus size={17}/> Add medicine</button></div><div className="safety-strip"><ShieldCheck size={21}/><div><b>Safety information</b><span>No match found is not proof that a medicine is safe. Ask a healthcare professional about any concern.</span></div></div><div className="medicine-cards">{activeMeds.length?activeMeds.map(m=><article className="medicine-card" key={m.id}><div className="medicine-top"><div className="med-icon"><Pill size={22}/></div><div className="med-name"><h3>{m.name}</h3><p>{m.strength||"Strength not recorded"} · {m.frequency}</p></div><button className="outline-button compact" onClick={()=>startNewMed(m)}>Edit</button></div><div className="med-detail-grid"><div><small>DOSAGE AS ENTERED</small><p>{m.dosage||"Not recorded — check prescription"}</p></div><div><small>SCHEDULED TIMES</small><p>{m.times.map(formatTime).join(" · ")}</p></div><div><small>FOOD INSTRUCTION</small><p>{m.food||"No specific food instruction confirmed. Please follow your prescription and ask your doctor or pharmacist if unsure."}</p></div><div><small>INFORMATION SOURCE</small><p>{m.source}{m.confirmed?" · confirmed by user":" · needs confirmation"}</p></div></div>{safetyMatch(m.name).length>0?<div className="risk-warning"><AlertTriangle size={18}/><div><b>Possible allergy match — review required</b><p>Medicine text matches recorded allergy: {safetyMatch(m.name).join(", ")}. Verify with a qualified healthcare professional before proceeding. This is not a diagnosis.</p></div></div>:<div className="safety-neutral"><CircleHelp size={16}/>No match detected in available text. This is not a medical clearance.</div>}<div className="medicine-foot"><span><Clock3 size={15}/> Next: {m.times.map(formatTime).join(", ")}</span><button className="text-link danger-link" onClick={()=>setMeds(ms=>ms.map(x=>x.id===m.id?{...x,active:false}:x))}>Remove</button></div></article>):<div className="empty-card"><Pill size={25}/><b>No medicines saved</b><p>Add details exactly as prescribed. Unclear details should be confirmed with a professional.</p></div>}</div><div className="section-heading history-heading"><div><h2>Today’s dose history</h2><p>Only actions you confirm are recorded.</p></div></div><div className="history-card">{todayDoses.filter(d=>doses[d.key]).length?todayDoses.filter(d=>doses[d.key]).map(d=><div className="history-row" key={d.key}><CheckCircle2 size={17}/><b>{d.med.name}</b><span>{formatTime(d.time)}</span><em className={`status-chip ${doses[d.key]?.status}`}>{doses[d.key]?.status}</em></div>):<p className="muted">No doses marked yet today.</p>}</div><div className="reminder-settings"><div className="reminder-copy"><span className="mini-icon mint"><Bell size={18}/></span><div><b>Reminders while app is open</b><small>Enable browser permission to show reminders at scheduled times. They may not appear while closed or offline.</small></div></div><div className="button-row"><button className="outline-button" onClick={requestNotifications}>{notifPermission==="granted"?"Notifications enabled":"Enable notifications"}</button><button className="outline-button" onClick={testReminder}><Volume2 size={16}/> Test reminder</button></div></div></div>}
 
